@@ -1069,6 +1069,7 @@ struct it87_data {
 
 	u8 smbus_bitmap;	/* !=0 if SMBus needs to be disabled */
 	u8 saved_bank;		/* saved bank register value */
+	bool restore_bank;	/* saved_bank came from a responding chip */
 	u8 ec_special_config;	/* EC special config register restore value */
 	u8 sioaddr;		/* SIO port address */
 
@@ -1130,6 +1131,7 @@ struct it87_data {
 	unsigned short addr;
 	struct mutex update_lock;
 	bool valid;		/* true if following fields are valid */
+	bool stuck;		/* the last update failed: report errors until the next */
 	unsigned long last_updated;	/* In jiffies */
 
 	u16 in_scaled;		/* Internal voltage sensors are scaled */
@@ -2623,8 +2625,10 @@ static int smbus_disable(struct it87_data *data)
 		superio_outb(data->sioaddr, IT87_SPECIAL_CFG_REG,
 			     data->ec_special_config & ~data->smbus_bitmap);
 		superio_exit(data->sioaddr, has_noconf(data));
-		if (has_bank_sel(data) && !data->mmio)
+		if (has_bank_sel(data) && !data->mmio) {
 			data->saved_bank = _it87_io_read(data, IT87_REG_BANK);
+			data->restore_bank = true;
+		}
 	}
 	return 0;
 }
@@ -2634,7 +2638,7 @@ static int smbus_enable(struct it87_data *data)
 	int err;
 
 	if (data->smbus_bitmap) {
-		if (has_bank_sel(data) && !data->mmio)
+		if (has_bank_sel(data) && !data->mmio && data->restore_bank)
 			_it87_io_write(data, IT87_REG_BANK, data->saved_bank);
 		err = superio_enter(data->sioaddr, has_noconf(data));
 		if (err)
@@ -3353,14 +3357,53 @@ static void it87_update_pwm_ctrl(struct it87_data *data, int nr)
 	}
 }
 
+/*
+ * An embedded controller can access the chip through SMBus at any time.  On an
+ * ASUS PRIME X470-PRO with IT8665E, disabling SMBus in the middle of such an
+ * access leaves the chip ignoring the register index we write and returning the
+ * bank register's value for every register, until SMBus is enabled again and
+ * the controller next accesses the chip: at once if it was in the middle of a
+ * burst, otherwise with its next burst, half a second later.  So check two
+ * registers with known contents before and after accessing the others.
+ */
+static bool it87_responds(struct it87_data *data)
+{
+	return !(data->read(data, IT87_REG_CONFIG) & 0x80) &&
+	       data->read(data, IT87_REG_CHIPID) == 0x90;
+}
+
+/*
+ * A stall inside a controller burst clears within a millisecond, so retry
+ * after a few, then every 50 ms until well past the controller's next burst.
+ */
+#define IT87_TRIES	22
+
+static void it87_retry_wait(int tries)
+{
+	if (tries == 1)
+		usleep_range(3000, 6000);
+	else
+		msleep(50);
+}
+
 static int it87_lock(struct it87_data *data)
 {
-	int err;
+	int err, tries;
 
 	mutex_lock(&data->update_lock);
-	err = smbus_disable(data);
-	if (err)
-		mutex_unlock(&data->update_lock);
+	for (tries = 0; tries < IT87_TRIES; tries++) {
+		if (tries)
+			it87_retry_wait(tries);
+		err = smbus_disable(data);
+		if (err)
+			break;
+		if (it87_responds(data))
+			return 0;
+		data->restore_bank = false;
+		smbus_enable(data);
+		err = -EAGAIN;
+	}
+	mutex_unlock(&data->update_lock);
 	return err;
 }
 
@@ -3516,22 +3559,40 @@ static struct it87_data *it87_update_device(struct device *dev)
 {
 	struct it87_data *data = dev_get_drvdata(dev);
 	struct it87_data *ret = data;
-	int err;
+	int err, tries;
 
 	mutex_lock(&data->update_lock);
 
 	if (time_after(jiffies, data->last_updated + HZ + HZ / 2) ||
-		       !data->valid) {
-		err = smbus_disable(data);
-		if (err) {
-			ret = ERR_PTR(err);
-			goto unlock;
+		       (!data->valid && !data->stuck)) {
+		for (tries = 0; tries < IT87_TRIES; tries++) {
+			if (tries)
+				it87_retry_wait(tries);
+			err = smbus_disable(data);
+			if (err) {
+				ret = ERR_PTR(err);
+				goto unlock;
+			}
+			if (it87_responds(data)) {
+				it87_update_registers(data);
+				if (it87_responds(data))
+					break;
+				data->valid = false;
+			}
+			dev_dbg(dev, "chip not responding, try %d\n", tries + 1);
+			data->restore_bank = false;
+			smbus_enable(data);
 		}
-		it87_update_registers(data);
 		data->last_updated = jiffies;
-		data->valid = true;
-		smbus_enable(data);
+		data->stuck = tries == IT87_TRIES;
+		if (!data->stuck) {
+			data->valid = true;
+			smbus_enable(data);
+		}
 	}
+	/* Missing readings beat stale ones, so fail until the chip recovers */
+	if (data->stuck)
+		ret = ERR_PTR(-EAGAIN);
 unlock:
 	mutex_unlock(&data->update_lock);
 	return ret;
@@ -6987,9 +7048,7 @@ static int it87_probe(struct platform_device *pdev)
 	if (err)
 		return err;
 
-	if ((data->read(data, IT87_REG_CONFIG) & 0x80) ||
-       data->read(data, IT87_REG_CHIPID) != 0x90)
-	{
+	if (!it87_responds(data)) {
 		smbus_enable(data);
 		return -ENODEV;
 	}
