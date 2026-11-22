@@ -3398,13 +3398,125 @@ static void it87_restore_firmware_state(void *arg)
 			err);
 }
 
+static void it87_update_registers(struct it87_data *data)
+{
+	u16 tach_lsb, tach_msb;
+	int i;
+
+	if (update_vbat) {
+		/*
+		 * Cleared after each update, so reenable.  Value
+		 * returned by this read will be previous value
+		 */
+		data->write(data, IT87_REG_CONFIG,
+			    data->read(data, IT87_REG_CONFIG) | 0x40);
+	}
+	for (i = 0; i < NUM_VIN; i++) {
+		if (!(data->has_in & BIT(i)))
+			continue;
+
+		data->in[i][0] = data->read(data, IT87_REG_VIN[i]);
+
+		/* VBAT and AVCC don't have limit registers */
+		if (i >= NUM_VIN_LIMIT)
+			continue;
+
+		data->in[i][1] = data->read(data, IT87_REG_VIN_MIN(i));
+		data->in[i][2] = data->read(data, IT87_REG_VIN_MAX(i));
+	}
+
+	for (i = 0; i < NUM_FAN; i++) {
+		/* Skip disabled fans */
+		if (!(data->has_fan & BIT(i)))
+			continue;
+
+		/*
+		 * IT879x G3 and IT57xx tachometers live in H2RAM.  Handle
+		 * them before the legacy register arrays; fan7 has no legacy
+		 * EC register slot at all.  Only fanN_input is meaningful for
+		 * these channels; the legacy EC min/alarm/beep/divisor state
+		 * does not describe the H2RAM tachometer path.
+		 */
+		if (it87_h2ram_tach_regs(data, i, &tach_lsb, &tach_msb)) {
+			data->fan[i][0] = data->read(data, tach_lsb);
+			data->fan[i][0] |= data->read(data, tach_msb) << 8;
+			continue;
+		}
+
+		data->fan[i][1] = data->read(data,
+				data->REG_FAN_MIN[i]);
+		data->fan[i][0] = data->read(data, data->REG_FAN[i]);
+		/* Add high byte if in 16-bit mode */
+		if (has_16bit_fans(data)) {
+			data->fan[i][0] |= data->read(data,
+					data->REG_FANX[i]) << 8;
+			data->fan[i][1] |= data->read(data,
+					data->REG_FANX_MIN[i]) << 8;
+		}
+	}
+	for (i = 0; i < NUM_TEMP; i++) {
+		if (!(data->has_temp & BIT(i)))
+			continue;
+		data->temp[i][0] =
+			data->read(data, IT87_REG_TEMP(i));
+
+		if (i >= data->num_temp_limit)
+			continue;
+
+		if (i < data->num_temp_offset)
+			data->temp[i][3] =
+			  data->read(data, data->REG_TEMP_OFFSET[i]);
+
+		data->temp[i][1] =
+			data->read(data, data->REG_TEMP_LOW[i]);
+		data->temp[i][2] =
+			data->read(data, data->REG_TEMP_HIGH[i]);
+	}
+
+	/* Newer chips don't have clock dividers */
+	if ((data->has_fan & 0x07) && !has_16bit_fans(data)) {
+		i = data->read(data, IT87_REG_FAN_DIV);
+		data->fan_div[0] = i & 0x07;
+		data->fan_div[1] = (i >> 3) & 0x07;
+		data->fan_div[2] = (i & 0x40) ? 3 : 1;
+	}
+
+	data->alarms =
+		data->read(data, IT87_REG_ALARM1) |
+		(data->read(data, IT87_REG_ALARM2) << 8) |
+		(data->read(data, IT87_REG_ALARM3) << 16);
+	data->beeps = data->read(data, IT87_REG_BEEP_ENABLE);
+
+	data->fan_main_ctrl = data->read(data, IT87_REG_FAN_MAIN_CTRL);
+	data->fan_ctl = data->read(data, IT87_REG_FAN_CTL);
+	for (i = 0; i < NUM_PWM; i++) {
+		if (!(data->has_pwm & BIT(i)))
+			continue;
+		it87_update_pwm_ctrl(data, i);
+	}
+
+	data->sensor = data->read(data, IT87_REG_TEMP_ENABLE);
+	data->extra = data->read(data, IT87_REG_TEMP_EXTRA);
+	/*
+	 * The IT8705F does not have VID capability.
+	 * The IT8718F and later don't use IT87_REG_VID for the
+	 * same purpose.
+	 */
+	if (data->type == it8712 || data->type == it8716) {
+		data->vid = data->read(data, IT87_REG_VID);
+		/*
+		 * The older IT8712F revisions had only 5 VID pins,
+		 * but we assume it is always safe to read 6 bits.
+		 */
+		data->vid &= 0x3f;
+	}
+}
+
 static struct it87_data *it87_update_device(struct device *dev)
 {
 	struct it87_data *data = dev_get_drvdata(dev);
 	struct it87_data *ret = data;
-	u16 tach_lsb, tach_msb;
 	int err;
-	int i;
 
 	mutex_lock(&data->update_lock);
 
@@ -3415,113 +3527,7 @@ static struct it87_data *it87_update_device(struct device *dev)
 			ret = ERR_PTR(err);
 			goto unlock;
 		}
-		if (update_vbat) {
-			/*
-			 * Cleared after each update, so reenable.  Value
-			 * returned by this read will be previous value
-			 */
-			data->write(data, IT87_REG_CONFIG,
-				    data->read(data, IT87_REG_CONFIG) | 0x40);
-		}
-		for (i = 0; i < NUM_VIN; i++) {
-			if (!(data->has_in & BIT(i)))
-				continue;
-
-			data->in[i][0] = data->read(data, IT87_REG_VIN[i]);
-
-			/* VBAT and AVCC don't have limit registers */
-			if (i >= NUM_VIN_LIMIT)
-				continue;
-
-			data->in[i][1] = data->read(data, IT87_REG_VIN_MIN(i));
-			data->in[i][2] = data->read(data, IT87_REG_VIN_MAX(i));
-		}
-
-		for (i = 0; i < NUM_FAN; i++) {
-			/* Skip disabled fans */
-			if (!(data->has_fan & BIT(i)))
-				continue;
-
-			/*
-			 * IT879x G3 and IT57xx tachometers live in H2RAM.  Handle
-			 * them before the legacy register arrays; fan7 has no legacy
-			 * EC register slot at all.  Only fanN_input is meaningful for
-			 * these channels; the legacy EC min/alarm/beep/divisor state
-			 * does not describe the H2RAM tachometer path.
-			 */
-			if (it87_h2ram_tach_regs(data, i, &tach_lsb, &tach_msb)) {
-				data->fan[i][0] = data->read(data, tach_lsb);
-				data->fan[i][0] |= data->read(data, tach_msb) << 8;
-				continue;
-			}
-
-			data->fan[i][1] = data->read(data,
-					data->REG_FAN_MIN[i]);
-			data->fan[i][0] = data->read(data, data->REG_FAN[i]);
-			/* Add high byte if in 16-bit mode */
-			if (has_16bit_fans(data)) {
-				data->fan[i][0] |= data->read(data,
-						data->REG_FANX[i]) << 8;
-				data->fan[i][1] |= data->read(data,
-						data->REG_FANX_MIN[i]) << 8;
-			}
-		}
-		for (i = 0; i < NUM_TEMP; i++) {
-			if (!(data->has_temp & BIT(i)))
-				continue;
-			data->temp[i][0] =
-				data->read(data, IT87_REG_TEMP(i));
-
-			if (i >= data->num_temp_limit)
-				continue;
-
-			if (i < data->num_temp_offset)
-				data->temp[i][3] =
-				  data->read(data, data->REG_TEMP_OFFSET[i]);
-
-			data->temp[i][1] =
-				data->read(data, data->REG_TEMP_LOW[i]);
-			data->temp[i][2] =
-				data->read(data, data->REG_TEMP_HIGH[i]);
-		}
-
-		/* Newer chips don't have clock dividers */
-		if ((data->has_fan & 0x07) && !has_16bit_fans(data)) {
-			i = data->read(data, IT87_REG_FAN_DIV);
-			data->fan_div[0] = i & 0x07;
-			data->fan_div[1] = (i >> 3) & 0x07;
-			data->fan_div[2] = (i & 0x40) ? 3 : 1;
-		}
-
-		data->alarms =
-			data->read(data, IT87_REG_ALARM1) |
-			(data->read(data, IT87_REG_ALARM2) << 8) |
-			(data->read(data, IT87_REG_ALARM3) << 16);
-		data->beeps = data->read(data, IT87_REG_BEEP_ENABLE);
-
-		data->fan_main_ctrl = data->read(data, IT87_REG_FAN_MAIN_CTRL);
-		data->fan_ctl = data->read(data, IT87_REG_FAN_CTL);
-		for (i = 0; i < NUM_PWM; i++) {
-			if (!(data->has_pwm & BIT(i)))
-				continue;
-			it87_update_pwm_ctrl(data, i);
-		}
-
-		data->sensor = data->read(data, IT87_REG_TEMP_ENABLE);
-		data->extra = data->read(data, IT87_REG_TEMP_EXTRA);
-		/*
-		 * The IT8705F does not have VID capability.
-		 * The IT8718F and later don't use IT87_REG_VID for the
-		 * same purpose.
-		 */
-		if (data->type == it8712 || data->type == it8716) {
-			data->vid = data->read(data, IT87_REG_VID);
-			/*
-			 * The older IT8712F revisions had only 5 VID pins,
-			 * but we assume it is always safe to read 6 bits.
-			 */
-			data->vid &= 0x3f;
-		}
+		it87_update_registers(data);
 		data->last_updated = jiffies;
 		data->valid = true;
 		smbus_enable(data);
